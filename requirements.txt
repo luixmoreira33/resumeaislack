@@ -1,0 +1,5 @@
+slack_bolt
+slack_sdk
+google-genai
+requests
+flask
