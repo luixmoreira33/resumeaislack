@@ -46,7 +46,7 @@ def analyze_with_gemini(text_content: str) -> dict:
 Texto: {text_content}
 Responda SOMENTE JSON: {{"title":"...", "description":"...", "due_date":"YYYY-MM-DD ou null", "priority":"alta|média|baixa", "labels":["urgente","dev",...]}}"""
     resp = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash-exp",
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
     )
