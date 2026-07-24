@@ -492,33 +492,30 @@ SELECT_LIST_PAGE = """
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }} — Escolher lista</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; }
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
     .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 24px; }
-    h1 { font-size: 1.3rem; }
-    select, button { width: 100%; padding: 12px; margin-top: 8px; font-size: 1rem; border-radius: 8px; }
-    button { background: #0079BF; color: #fff; border: none; font-weight: 600; cursor: pointer; }
+    h1 { font-size: 1.35rem; margin: 0 0 8px; }
+    p { color: #555; line-height: 1.5; margin: 0 0 16px; }
+    label { display: block; font-weight: 600; margin-bottom: 8px; }
+    select, button { width: 100%; padding: 12px; font-size: 1rem; border-radius: 8px; box-sizing: border-box; }
+    select { border: 1px solid #ccc; background: #fff; }
+    button { margin-top: 16px; background: #0079BF; color: #fff; border: none; font-weight: 600; cursor: pointer; }
     button:hover { background: #026aa7; }
-    .board { margin-top: 16px; padding-top: 12px; border-top: 1px solid #eee; }
-    .board h3 { margin: 0 0 6px; font-size: 1rem; color: #333; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>Escolha a lista padrão</h1>
-    <p>As tarefas criadas pelo bot irão para esta lista do Trello.</p>
+    <h1>Escolha onde salvar as tarefas</h1>
+    <p>Selecione o <strong>quadro</strong> e a <strong>lista</strong> do Trello. As tarefas do bot vão para lá.</p>
     <form method="POST" action="/trello/select-list">
       <input type="hidden" name="slack_user_id" value="{{ slack_user_id }}">
-      {% for board in boards %}
-        <div class="board">
-          <h3>{{ board.name }}</h3>
-          <select name="list_id">
-            {% for lst in board.lists %}
-              <option value="{{ lst.id }}|{{ board.id }}">{{ lst.name }}</option>
-            {% endfor %}
-          </select>
-        </div>
-      {% endfor %}
-      <button type="submit">Salvar lista padrão</button>
+      <label for="list_id">Quadro → Lista</label>
+      <select id="list_id" name="list_id" required>
+        {% for opt in options %}
+          <option value="{{ opt.value }}"{% if opt.selected %} selected{% endif %}>{{ opt.label }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Salvar e continuar</button>
     </form>
   </div>
 </body>
@@ -619,7 +616,8 @@ def trello_select_list():
 
     try:
         boards_raw = trello_boards(user["trello_token"])
-        boards = []
+        options = []
+        preferred = None
         for b in boards_raw:
             if b.get("closed"):
                 continue
@@ -627,15 +625,33 @@ def trello_select_list():
                 lst for lst in trello_lists(user["trello_token"], b["id"])
                 if not lst.get("closed")
             ]
-            if lists:
-                boards.append({"id": b["id"], "name": b["name"], "lists": lists})
-        if not boards:
-            return "Nenhum board/lista aberto encontrado no seu Trello.", 400
+            for lst in lists:
+                label = f"{b['name']} → {lst['name']}"
+                value = f"{lst['id']}|{b['id']}"
+                opt = {"label": label, "value": value, "selected": False}
+                # Prefere board/lista com nomes comuns (ex.: RESUMEAI / A fazer)
+                name_b = (b.get("name") or "").lower()
+                name_l = (lst.get("name") or "").lower()
+                if preferred is None and (
+                    "resumeai" in name_b
+                    or name_l in ("a fazer", "to do", "todo", "inbox", "caixa de entrada")
+                ):
+                    preferred = len(options)
+                options.append(opt)
+
+        if not options:
+            return "Nenhum quadro/lista aberto encontrado no seu Trello.", 400
+
+        if preferred is not None:
+            options[preferred]["selected"] = True
+        else:
+            options[0]["selected"] = True
+
         return render_template_string(
             SELECT_LIST_PAGE,
             app_name=APP_NAME,
             slack_user_id=slack_user_id,
-            boards=boards,
+            options=options,
         )
     except Exception as e:
         logger.exception("select-list error")
