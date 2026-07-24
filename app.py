@@ -200,7 +200,7 @@ def create_trello_card_for_user(user: dict, task_data: dict, slack_link: str = N
 
 def list_recent_tasks_for_user(user: dict) -> str:
     if not user.get("trello_list_id"):
-        return "⚠️ Você ainda não escolheu uma lista padrão. Use `/conectar` novamente."
+        return "⚠️ Você ainda não escolheu uma lista padrão. Use `/primeiro-login` novamente."
     try:
         cards = trello_get(
             f"/lists/{user['trello_list_id']}/cards",
@@ -281,7 +281,8 @@ def connect_message(slack_user_id: str) -> str:
         f"1. Clique no link abaixo\n"
         f"2. Autorize o acesso no Trello\n"
         f"3. Escolha a lista padrão onde as tarefas serão criadas\n\n"
-        f"<{link}|Conectar meu Trello>"
+        f"<{link}|Conectar meu Trello>\n\n"
+        f"_Ou digite `/primeiro-login` a qualquer momento._"
     )
 
 
@@ -381,8 +382,8 @@ def handle_tarefas(ack, say, command):
     say(list_recent_tasks_for_user(user))
 
 
-@app_slack.command("/conectar")
-def handle_conectar(ack, say, command):
+@app_slack.command("/primeiro-login")
+def handle_primeiro_login(ack, say, command):
     ack()
     user_id = command.get("user_id")
     say(connect_message(user_id))
@@ -393,7 +394,7 @@ def handle_desconectar(ack, say, command):
     ack()
     user_id = command.get("user_id")
     delete_user(user_id)
-    say("✅ Seu Trello foi desconectado. Use `/conectar` quando quiser vincular de novo.")
+    say("✅ Seu Trello foi desconectado. Use `/primeiro-login` quando quiser vincular de novo.")
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +542,7 @@ SUCCESS_PAGE = """
   <div class="card">
     <h1>✅ Trello conectado!</h1>
     <p>Você já pode voltar ao Slack e marcar o bot ou enviar mensagens no DM.</p>
-    <p>Comandos úteis: <code>/tarefas</code> · <code>/conectar</code> · <code>/desconectar</code></p>
+    <p>Comandos úteis: <code>/tarefas</code> · <code>/primeiro-login</code> · <code>/desconectar</code></p>
   </div>
 </body>
 </html>
@@ -614,7 +615,7 @@ def trello_select_list():
     slack_user_id = request.args.get("slack_user_id", "").strip()
     user = get_user(slack_user_id)
     if not user or not user.get("trello_token"):
-        return "Usuário não encontrado. Refaça o fluxo /conectar.", 404
+        return "Usuário não encontrado. Refaça o fluxo /primeiro-login.", 404
 
     try:
         boards_raw = trello_boards(user["trello_token"])
