@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import logging
 import threading
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from urllib.parse import quote
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from flask import Flask, request, redirect, render_template_string
+from flask import Flask, request, render_template_string
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from google import genai
@@ -43,6 +44,7 @@ DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://"
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
 APP_NAME = os.environ.get("APP_NAME", "ResumeAI")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "5"))
 
 # ---------------------------------------------------------------------------
 # Apps
@@ -55,6 +57,11 @@ _BOT_USER_ID = None
 _PROCESSED = set()
 _PROCESSED_LOCK = threading.Lock()
 
+IMAGE_MIMES = {
+    "image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp",
+    "image/heic", "image/heif",
+}
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -63,7 +70,6 @@ def get_db():
 
 
 def init_db():
-    """Create tables if they do not exist."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -117,12 +123,8 @@ def save_user(
                     updated_at = NOW()
                 """,
                 (
-                    slack_user_id,
-                    slack_name,
-                    trello_token,
-                    trello_member_id,
-                    trello_list_id,
-                    trello_board_id,
+                    slack_user_id, slack_name, trello_token,
+                    trello_member_id, trello_list_id, trello_board_id,
                 ),
             )
         conn.commit()
@@ -152,7 +154,7 @@ def delete_user(slack_user_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Trello helpers (per-user token)
+# Trello helpers
 # ---------------------------------------------------------------------------
 def trello_get(path: str, token: str, params: dict = None):
     p = {"key": TRELLO_API_KEY, "token": token}
@@ -220,40 +222,7 @@ def list_recent_tasks_for_user(user: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gemini
-# ---------------------------------------------------------------------------
-def analyze_with_gemini(text_content: str) -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    prompt = f"""Você é um assistente de produtividade. Analise o texto abaixo e extraia a tarefa principal.
-
-Data de hoje: {today}
-
-Texto:
-\"\"\"{text_content}\"\"\"
-
-Responda APENAS com JSON válido (sem markdown):
-{{
-  "title": "Título curto e objetivo (máx 60 caracteres)",
-  "description": "Resumo claro do que precisa ser feito, contexto e responsáveis",
-  "due_date": "YYYY-MM-DD ou null",
-  "priority": "alta|média|baixa",
-  "labels": ["urgente", "dev", "design", "reunião"]
-}}
-"""
-    resp = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    raw = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(raw)
-    if "title" not in data or "description" not in data:
-        raise ValueError(f"Resposta incompleta do Gemini: {data}")
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Slack helpers
+# Slack message / file extraction
 # ---------------------------------------------------------------------------
 def get_bot_user_id(client):
     global _BOT_USER_ID
@@ -274,6 +243,174 @@ def already_processed(event_id: str) -> bool:
         return False
 
 
+def download_slack_file(file_meta: dict) -> tuple:
+    """Download a Slack file; return (bytes, mime) or (None, None)."""
+    url = file_meta.get("url_private_download") or file_meta.get("url_private")
+    if not url:
+        return None, None
+    try:
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        mime = file_meta.get("mimetype") or r.headers.get("Content-Type", "application/octet-stream")
+        mime = mime.split(";")[0].strip()
+        return r.content, mime
+    except Exception as e:
+        logger.warning(f"Falha ao baixar arquivo Slack: {e}")
+        return None, None
+
+
+def extract_from_message(msg: dict) -> tuple:
+    """
+    Extrai texto enriquecido e metadados de imagens de uma mensagem Slack.
+    Retorna (texto, lista_de_file_meta_imagem).
+    """
+    parts = []
+    images = []
+
+    text = (msg.get("text") or "").strip()
+    if text:
+        parts.append(text)
+
+    # Blocos ricos (links, listas, etc.)
+    for block in msg.get("blocks") or []:
+        if block.get("type") == "rich_text":
+            continue  # já costuma estar em text
+        if block.get("type") == "section":
+            t = (block.get("text") or {}).get("text")
+            if t and t not in text:
+                parts.append(t)
+
+    # Attachments legados (unfurl de links)
+    for att in msg.get("attachments") or []:
+        title = att.get("title") or att.get("fallback") or ""
+        title_link = att.get("title_link") or att.get("from_url") or ""
+        att_text = att.get("text") or att.get("pretext") or ""
+        if title or att_text or title_link:
+            chunk = "[Anexo/link]"
+            if title:
+                chunk += f" {title}"
+            if title_link:
+                chunk += f" ({title_link})"
+            if att_text:
+                chunk += f": {att_text}"
+            parts.append(chunk)
+
+    # Arquivos
+    for f in msg.get("files") or []:
+        name = f.get("name") or f.get("title") or "arquivo"
+        mime = (f.get("mimetype") or "").lower()
+        permalink = f.get("permalink") or ""
+        if mime in IMAGE_MIMES or (f.get("filetype") or "").lower() in (
+            "png", "jpg", "jpeg", "gif", "webp", "heic", "heif"
+        ):
+            images.append(f)
+            parts.append(f"[Imagem anexada: {name}] {permalink}".strip())
+        else:
+            # PDF, planilha, doc — pelo menos registrar nome e link
+            parts.append(f"[Arquivo: {name} | tipo: {mime or f.get('filetype')}] {permalink}".strip())
+
+    return "\n".join(p for p in parts if p).strip(), images
+
+
+def build_thread_context(client, channel_id: str, thread_ts: str, fallback_text: str = "") -> tuple:
+    """
+    Monta contexto completo da thread (ou mensagem única) + lista de imagens baixadas.
+    Retorna (texto, [(bytes, mime), ...]).
+    """
+    messages = []
+    try:
+        replies = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
+            inclusive=True,
+            limit=50,
+        )
+        messages = replies.get("messages") or []
+    except Exception as e:
+        logger.warning(f"conversations_replies falhou: {e}")
+
+    if not messages:
+        # Fallback: só o texto cru do evento
+        return (fallback_text or "").strip(), []
+
+    text_chunks = []
+    image_metas = []
+    bot_id = get_bot_user_id(client)
+
+    for msg in messages:
+        if msg.get("bot_id") and msg.get("user") != bot_id:
+            # inclui mensagens humanas; pula ruído de outros bots se necessário
+            pass
+        chunk, imgs = extract_from_message(msg)
+        if chunk:
+            user = msg.get("user") or msg.get("username") or "alguém"
+            text_chunks.append(f"[{user}]: {chunk}")
+        image_metas.extend(imgs)
+
+    full_text = "\n---\n".join(text_chunks)
+    full_text = full_text.replace(f"<@{bot_id}>", "").strip()
+
+    # Baixa imagens (limite MAX_IMAGES)
+    downloaded = []
+    for meta in image_metas[:MAX_IMAGES]:
+        data, mime = download_slack_file(meta)
+        if data and mime:
+            downloaded.append((data, mime))
+
+    return full_text, downloaded
+
+
+# ---------------------------------------------------------------------------
+# Gemini (texto + imagens)
+# ---------------------------------------------------------------------------
+def analyze_with_gemini(text_content: str, images: list = None) -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prompt = f"""Você é um assistente de produtividade. Analise TODO o contexto abaixo
+(mensagens de thread do Slack, links, nomes de arquivos e imagens anexadas).
+
+Se houver imagens, leia o texto visível nelas (OCR) e use essas informações.
+Se houver links (planilhas, docs, etc.), inclua-os na descrição da tarefa
+e extraia qualquer detalhe útil do texto ao redor.
+Preserve detalhes importantes: nomes, prazos, URLs, números, responsáveis.
+
+Data de hoje: {today}
+
+Contexto:
+\"\"\"{text_content}\"\"\"
+
+Responda APENAS com JSON válido (sem markdown):
+{{
+  "title": "Título curto e objetivo (máx 60 caracteres)",
+  "description": "Resumo completo do que precisa ser feito, com contexto, links e detalhes relevantes",
+  "due_date": "YYYY-MM-DD ou null",
+  "priority": "alta|média|baixa",
+  "labels": ["urgente", "dev", "design", "reunião"]
+}}
+"""
+
+    parts = [types.Part.from_text(text=prompt)]
+    for data, mime in (images or []):
+        try:
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+        except Exception as e:
+            logger.warning(f"Não foi possível anexar imagem ao Gemini: {e}")
+
+    resp = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=parts,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    raw = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+    if "title" not in data or "description" not in data:
+        raise ValueError(f"Resposta incompleta do Gemini: {data}")
+    return data
+
+
 def connect_message(slack_user_id: str) -> str:
     link = f"{BASE_URL}/trello/connect?slack_user_id={quote(slack_user_id)}"
     return (
@@ -289,41 +426,49 @@ def connect_message(slack_user_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
-def process_task_request(client, say, channel_id, thread_ts, raw_text, is_thread, slack_user_id):
+def process_task_request(client, say, channel_id, thread_ts, raw_text, slack_user_id):
     try:
         user = get_user(slack_user_id)
         if not user or not user.get("trello_token") or not user.get("trello_list_id"):
             say(connect_message(slack_user_id), thread_ts=thread_ts)
             return
 
-        if is_thread:
-            replies = client.conversations_replies(channel=channel_id, ts=thread_ts)
-            full_context = "\n---\n".join(m.get("text", "") for m in replies.get("messages", []))
-        else:
-            full_context = raw_text
+        say("⏳ Analisando mensagem, thread e anexos…", thread_ts=thread_ts)
 
-        bot_id = get_bot_user_id(client)
-        full_context = full_context.replace(f"<@{bot_id}>", "").strip()
+        full_context, images = build_thread_context(
+            client, channel_id, thread_ts, fallback_text=raw_text or ""
+        )
 
-        if len(full_context) < 10:
-            say("⚠️ Texto muito curto para gerar uma tarefa.", thread_ts=thread_ts)
+        if len(full_context) < 5 and not images:
+            say("⚠️ Não encontrei texto nem imagens suficientes para gerar uma tarefa.", thread_ts=thread_ts)
             return
 
         permalink = ""
         try:
-            permalink = client.chat_getPermalink(channel=channel_id, message_ts=thread_ts).get("permalink", "")
+            permalink = client.chat_getPermalink(
+                channel=channel_id, message_ts=thread_ts
+            ).get("permalink", "")
         except Exception:
             pass
 
-        task = analyze_with_gemini(full_context)
+        task = analyze_with_gemini(full_context, images)
         card = create_trello_card_for_user(user, task, permalink)
 
-        due = f"\n📅 Prazo: {task.get('due_date')}" if task.get("due_date") and str(task.get("due_date")).lower() != "null" else ""
-        prio = f"\n🔥 Prioridade: {task.get('priority', 'média')}" if task.get("priority") else ""
+        due = (
+            f"\n📅 Prazo: {task.get('due_date')}"
+            if task.get("due_date") and str(task.get("due_date")).lower() != "null"
+            else ""
+        )
+        prio = (
+            f"\n🔥 Prioridade: {task.get('priority', 'média')}"
+            if task.get("priority")
+            else ""
+        )
+        img_note = f"\n🖼️ {len(images)} imagem(ns) analisada(s)" if images else ""
 
         say(
             f"✅ Tarefa criada no *seu* Trello!\n"
-            f"📌 *{card['name']}*{due}{prio}\n"
+            f"📌 *{card['name']}*{due}{prio}{img_note}\n"
             f"🔗 <{card['url']}|Abrir card>",
             thread_ts=thread_ts,
         )
@@ -343,10 +488,9 @@ def handle_mention(body, say, client):
     slack_user_id = event.get("user")
     channel_id = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
-    is_thread = "thread_ts" in event
     threading.Thread(
         target=process_task_request,
-        args=(client, say, channel_id, thread_ts, event.get("text", ""), is_thread, slack_user_id),
+        args=(client, say, channel_id, thread_ts, event.get("text", ""), slack_user_id),
         daemon=True,
     ).start()
 
@@ -356,17 +500,26 @@ def handle_dm(body, say, client):
     event = body.get("event", {})
     if event.get("channel_type") != "im":
         return
-    if event.get("subtype") or event.get("bot_id"):
+    # Permite mensagens normais e compartilhamento de arquivo; ignora edits/joins
+    subtype = event.get("subtype")
+    if subtype and subtype not in ("file_share", "file_share_deleted"):
+        if subtype != "file_share":
+            return
+    if event.get("bot_id"):
         return
     if already_processed(body.get("event_id")):
         return
+
+    # file_share_deleted não gera tarefa
+    if subtype == "file_share_deleted":
+        return
+
     slack_user_id = event.get("user")
     channel_id = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
-    is_thread = "thread_ts" in event
     threading.Thread(
         target=process_task_request,
-        args=(client, say, channel_id, thread_ts, event.get("text", ""), is_thread, slack_user_id),
+        args=(client, say, channel_id, thread_ts, event.get("text", ""), slack_user_id),
         daemon=True,
     ).start()
 
@@ -398,7 +551,7 @@ def handle_desconectar(ack, say, command):
 
 
 # ---------------------------------------------------------------------------
-# Flask routes — health + Trello OAuth
+# Flask routes
 # ---------------------------------------------------------------------------
 @app_flask.route("/")
 def health_check():
@@ -467,13 +620,9 @@ CALLBACK_PAGE = """
       })
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        if (data.redirect) {
-          window.location = data.redirect;
-        } else if (data.error) {
-          document.getElementById("msg").textContent = "Erro: " + data.error;
-        } else {
-          document.getElementById("msg").textContent = "Conectado! Você já pode voltar ao Slack.";
-        }
+        if (data.redirect) { window.location = data.redirect; }
+        else if (data.error) { document.getElementById("msg").textContent = "Erro: " + data.error; }
+        else { document.getElementById("msg").textContent = "Conectado! Você já pode voltar ao Slack."; }
       })
       .catch(function (e) {
         document.getElementById("msg").textContent = "Erro de rede: " + e;
@@ -551,17 +700,12 @@ def trello_connect():
     slack_user_id = request.args.get("slack_user_id", "").strip()
     if not slack_user_id:
         return "slack_user_id é obrigatório", 400
-
     return_url = f"{BASE_URL}/trello/callback?slack_user_id={quote(slack_user_id)}"
     auth_url = (
         "https://trello.com/1/authorize"
-        f"?expiration=never"
-        f"&scope=read,write"
-        f"&response_type=token"
-        f"&name={quote(APP_NAME)}"
-        f"&key={TRELLO_API_KEY}"
-        f"&return_url={quote(return_url)}"
-        f"&callback_method=fragment"
+        f"?expiration=never&scope=read,write&response_type=token"
+        f"&name={quote(APP_NAME)}&key={TRELLO_API_KEY}"
+        f"&return_url={quote(return_url)}&callback_method=fragment"
     )
     return render_template_string(CONNECT_PAGE, app_name=APP_NAME, auth_url=auth_url)
 
@@ -571,9 +715,7 @@ def trello_callback():
     slack_user_id = request.args.get("slack_user_id", "").strip()
     if not slack_user_id:
         return "slack_user_id é obrigatório", 400
-    return render_template_string(
-        CALLBACK_PAGE, app_name=APP_NAME, slack_user_id=slack_user_id
-    )
+    return render_template_string(CALLBACK_PAGE, app_name=APP_NAME, slack_user_id=slack_user_id)
 
 
 @app_flask.route("/trello/save", methods=["POST"])
@@ -583,7 +725,6 @@ def trello_save():
     token = (data.get("token") or "").strip()
     if not slack_user_id or not token:
         return {"error": "slack_user_id e token são obrigatórios"}, 400
-
     try:
         member = trello_member(token)
         save_user(
@@ -629,7 +770,6 @@ def trello_select_list():
                 label = f"{b['name']} → {lst['name']}"
                 value = f"{lst['id']}|{b['id']}"
                 opt = {"label": label, "value": value, "selected": False}
-                # Prefere board/lista com nomes comuns (ex.: RESUMEAI / A fazer)
                 name_b = (b.get("name") or "").lower()
                 name_l = (lst.get("name") or "").lower()
                 if preferred is None and (
@@ -641,7 +781,6 @@ def trello_select_list():
 
         if not options:
             return "Nenhum quadro/lista aberto encontrado no seu Trello.", 400
-
         if preferred is not None:
             options[preferred]["selected"] = True
         else:
