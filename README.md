@@ -250,15 +250,6 @@ Para o redirect do Trello funcionar localmente, adicione `http://localhost:10000
 
 ---
 
-## 12. Roadmap sugerido
-
-- [ ] Labels automáticas no Trello conforme `labels` do Gemini
-- [ ] Prioridade visual (cores) no card
-- [ ] Suporte a Google Tasks como alternativa ao Trello
-- [ ] Dashboard web de usuários conectados (admin)
-- [ ] Múltiplas listas por usuário (inbox / urgente)
-
----
 
 ## Licença
 
