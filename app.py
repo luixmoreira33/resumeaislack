@@ -1,9 +1,11 @@
 import os
+import re
 import json
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlencode
 
 import requests
@@ -36,6 +38,15 @@ APP_NAME = os.environ.get("APP_NAME", "ResumeAI")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "5"))
 ATAS_POLL_SECONDS = int(os.environ.get("ATAS_POLL_SECONDS", "900"))
+ATAS_LOOKBACK_DAYS = int(os.environ.get("ATAS_LOOKBACK_DAYS", "3"))
+
+# Query Gmail: assunto/remetente típicos de atas do Meet + link de Docs
+ATAS_GMAIL_QUERY = os.environ.get(
+    "ATAS_GMAIL_QUERY",
+    'newer_than:{days}d (subject:Notes OR subject:"Meeting notes" OR subject:"Notas da reunião" '
+    'OR subject:"Notas:" OR subject:"notes for" OR from:meet.google.com OR from:google.com) '
+    '(docs.google.com OR drive.google.com)',
+)
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
@@ -46,6 +57,11 @@ GOOGLE_SCOPES = " ".join([
     "https://www.googleapis.com/auth/drive.readonly",
     "openid", "email", "profile",
 ])
+
+DOC_ID_RE = re.compile(
+    r"https?://docs\.google\.com/document/d/([a-zA-Z0-9_-]+)",
+    re.IGNORECASE,
+)
 
 app_slack = App(token=SLACK_BOT_TOKEN)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -60,6 +76,9 @@ IMAGE_MIMES = {
     "image/webp", "image/heic", "image/heif",
 }
 
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
@@ -100,6 +119,17 @@ def init_db():
                     EXCEPTION WHEN duplicate_column THEN NULL;
                     END $$;
                 """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS processed_atas (
+                    slack_user_id TEXT NOT NULL,
+                    gmail_msg_id  TEXT NOT NULL,
+                    doc_id        TEXT,
+                    meeting_title TEXT,
+                    tasks_created INT DEFAULT 0,
+                    processed_at  TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (slack_user_id, gmail_msg_id)
+                );
+            """)
             try:
                 cur.execute("ALTER TABLE users ALTER COLUMN trello_token DROP NOT NULL")
             except Exception:
@@ -190,8 +220,35 @@ def delete_user(slack_user_id):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE slack_user_id = %s", (slack_user_id,))
+            cur.execute("DELETE FROM processed_atas WHERE slack_user_id = %s", (slack_user_id,))
         conn.commit()
 
+def is_ata_processed(slack_user_id, gmail_msg_id):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM processed_atas WHERE slack_user_id = %s AND gmail_msg_id = %s",
+                (slack_user_id, gmail_msg_id),
+            )
+            return cur.fetchone() is not None
+
+def mark_ata_processed(slack_user_id, gmail_msg_id, doc_id=None, meeting_title=None, tasks_created=0):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO processed_atas (slack_user_id, gmail_msg_id, doc_id, meeting_title, tasks_created)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (slack_user_id, gmail_msg_id) DO NOTHING
+            """, (slack_user_id, gmail_msg_id, doc_id, meeting_title, tasks_created))
+            cur.execute(
+                "UPDATE users SET atas_last_check_at = NOW(), atas_last_doc_id = COALESCE(%s, atas_last_doc_id), updated_at = NOW() WHERE slack_user_id = %s",
+                (doc_id, slack_user_id),
+            )
+        conn.commit()
+
+# ---------------------------------------------------------------------------
+# Trello
+# ---------------------------------------------------------------------------
 def trello_get(path, token, params=None):
     p = {"key": TRELLO_API_KEY, "token": token}
     if params:
@@ -212,7 +269,7 @@ def trello_lists(token, board_id):
 def create_trello_card_for_user(user, task_data, slack_link=None):
     desc = task_data.get("description", "")
     if slack_link:
-        desc += f"\n\n🔗 Link Slack: {slack_link}"
+        desc += f"\n\n🔗 {slack_link}"
     query = {
         "key": TRELLO_API_KEY, "token": user["trello_token"],
         "idList": user["trello_list_id"],
@@ -242,6 +299,289 @@ def list_recent_tasks_for_user(user):
         logger.exception("list tasks error")
         return f"❌ Erro ao buscar tarefas: {e}"
 
+# ---------------------------------------------------------------------------
+# Google OAuth + Gmail + Docs
+# ---------------------------------------------------------------------------
+def refresh_google_access_token(user):
+    """Garante access_token válido; atualiza no banco. Retorna access_token ou None."""
+    refresh = user.get("google_refresh_token")
+    if not refresh or not GOOGLE_OAUTH_ENABLED:
+        return None
+
+    expiry = user.get("google_token_expiry")
+    access = user.get("google_access_token")
+    if access and expiry:
+        # margem de 60s
+        if getattr(expiry, "tzinfo", None) is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry > datetime.now(timezone.utc) + timedelta(seconds=60):
+            return access
+
+    try:
+        r = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": refresh,
+                "grant_type": "refresh_token",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        access = data.get("access_token")
+        expires_in = int(data.get("expires_in", 3600))
+        expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        save_google(user["slack_user_id"], access_token=access, expiry=expiry_dt)
+        return access
+    except Exception:
+        logger.exception("[atas] falha refresh token user=%s", user.get("slack_user_id"))
+        return None
+
+def gmail_headers(access_token):
+    return {"Authorization": f"Bearer {access_token}"}
+
+def gmail_list_ata_messages(access_token):
+    q = ATAS_GMAIL_QUERY.format(days=ATAS_LOOKBACK_DAYS)
+    r = requests.get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        headers=gmail_headers(access_token),
+        params={"q": q, "maxResults": 15},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("messages") or []
+
+def gmail_get_message(access_token, msg_id):
+    r = requests.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+        headers=gmail_headers(access_token),
+        params={"format": "full"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def _walk_parts(payload, out_text):
+    mime = (payload.get("mimeType") or "").lower()
+    body = payload.get("body") or {}
+    data = body.get("data")
+    if data and mime in ("text/plain", "text/html"):
+        import base64
+        try:
+            raw = base64.urlsafe_b64decode(data + "===")
+            out_text.append(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+    for part in payload.get("parts") or []:
+        _walk_parts(part, out_text)
+
+def extract_email_text_and_subject(msg):
+    headers = {h["name"].lower(): h["value"] for h in (msg.get("payload") or {}).get("headers") or []}
+    subject = headers.get("subject", "(sem assunto)")
+    texts = []
+    _walk_parts(msg.get("payload") or {}, texts)
+    body = "\n".join(texts)
+    # também snippet
+    snippet = msg.get("snippet") or ""
+    combined = f"{subject}\n{snippet}\n{body}"
+    return subject, combined
+
+def find_doc_ids(text):
+    return list(dict.fromkeys(DOC_ID_RE.findall(text or "")))
+
+def docs_read_text(access_token, doc_id):
+    r = requests.get(
+        f"https://docs.googleapis.com/v1/documents/{doc_id}",
+        headers=gmail_headers(access_token),
+        timeout=30,
+    )
+    r.raise_for_status()
+    doc = r.json()
+    title = doc.get("title") or "Reunião"
+    chunks = []
+
+    def walk(elements):
+        for el in elements or []:
+            if "paragraph" in el:
+                for pe in el["paragraph"].get("elements") or []:
+                    tr = pe.get("textRun")
+                    if tr and tr.get("content"):
+                        chunks.append(tr["content"])
+            if "table" in el:
+                for row in el["table"].get("tableRows") or []:
+                    for cell in row.get("tableCells") or []:
+                        walk(cell.get("content"))
+            if "tableOfContents" in el:
+                walk(el["tableOfContents"].get("content"))
+
+    walk(doc.get("body", {}).get("content"))
+    return title, "".join(chunks).strip()
+
+def analyze_ata_tasks(doc_text, meeting_title, person_name, person_email):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prompt = f"""Você analisa atas de reunião e extrai APENAS tarefas atribuídas a esta pessoa.
+
+Pessoa: {person_name or 'usuário'}
+E-mail: {person_email or 'n/a'}
+Reunião: {meeting_title}
+Hoje: {today}
+
+Considere ações quando:
+- o nome/e-mail da pessoa é citado como responsável
+- há "você", se o contexto for e-mail dela
+- itens de action item claramente dela
+
+Ignore tarefas de outras pessoas.
+Se não houver nenhuma tarefa dela, retorne lista vazia.
+
+Ata:
+\"\"\"{doc_text[:120000]}\"\"\"
+
+Responda APENAS JSON válido:
+{{
+  "meeting_title": "título curto da reunião",
+  "tasks": [
+    {{
+      "title": "máx 60 chars",
+      "description": "contexto e detalhes",
+      "due_date": "YYYY-MM-DD ou null",
+      "priority": "alta|média|baixa"
+    }}
+  ]
+}}
+"""
+    resp = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    raw = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+    tasks = data.get("tasks") or []
+    title = data.get("meeting_title") or meeting_title
+    return title, tasks
+
+def notify_slack_dm(slack_user_id, text):
+    try:
+        opened = app_slack.client.conversations_open(users=slack_user_id)
+        channel = opened["channel"]["id"]
+        app_slack.client.chat_postMessage(channel=channel, text=text)
+    except Exception:
+        logger.exception("[atas] falha DM user=%s", slack_user_id)
+
+def process_atas_for_user(user):
+    uid = user["slack_user_id"]
+    logger.info("[atas] processando user=%s email=%s", uid, user.get("google_email"))
+
+    access = refresh_google_access_token(user)
+    if not access:
+        logger.warning("[atas] sem access_token user=%s", uid)
+        return
+
+    try:
+        messages = gmail_list_ata_messages(access)
+    except Exception:
+        logger.exception("[atas] gmail list falhou user=%s", uid)
+        return
+
+    person_name = user.get("slack_name") or ""
+    person_email = user.get("google_email") or ""
+
+    for m in messages:
+        msg_id = m.get("id")
+        if not msg_id or is_ata_processed(uid, msg_id):
+            continue
+        try:
+            full = gmail_get_message(access, msg_id)
+            subject, body_text = extract_email_text_and_subject(full)
+            doc_ids = find_doc_ids(body_text)
+            if not doc_ids:
+                # e-mail parece ata mas sem link de Doc — marca para não reprocessar
+                mark_ata_processed(uid, msg_id, meeting_title=subject, tasks_created=0)
+                logger.info("[atas] sem doc link msg=%s subject=%s", msg_id, subject[:80])
+                continue
+
+            doc_id = doc_ids[0]
+            try:
+                meeting_title, doc_text = docs_read_text(access, doc_id)
+            except Exception:
+                logger.exception("[atas] docs read falhou doc=%s", doc_id)
+                mark_ata_processed(uid, msg_id, doc_id=doc_id, meeting_title=subject, tasks_created=0)
+                continue
+
+            if len(doc_text) < 40:
+                mark_ata_processed(uid, msg_id, doc_id=doc_id, meeting_title=meeting_title, tasks_created=0)
+                continue
+
+            meeting_title, tasks = analyze_ata_tasks(doc_text, meeting_title or subject, person_name, person_email)
+            created = []
+            doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+            for t in tasks:
+                if not t.get("title"):
+                    continue
+                card = create_trello_card_for_user(
+                    user,
+                    {
+                        "title": t["title"],
+                        "description": (t.get("description") or "") + f"\n\n📄 Ata: {doc_url}",
+                        "due_date": t.get("due_date"),
+                        "priority": t.get("priority") or "média",
+                    },
+                    slack_link=doc_url,
+                )
+                created.append(card)
+
+            mark_ata_processed(
+                uid, msg_id, doc_id=doc_id,
+                meeting_title=meeting_title,
+                tasks_created=len(created),
+            )
+
+            if created:
+                lines = [f"• <{c['url']}|{c['name']}>" for c in created[:8]]
+                notify_slack_dm(
+                    uid,
+                    f"✅ Criei *{len(created)}* tarefa(s) da reunião *{meeting_title}*\n"
+                    + "\n".join(lines)
+                    + f"\n📄 <{doc_url}|Abrir ata>",
+                )
+                logger.info("[atas] user=%s criou %s tarefas de %s", uid, len(created), meeting_title)
+            else:
+                logger.info("[atas] user=%s nenhuma tarefa própria em %s", uid, meeting_title)
+        except Exception:
+            logger.exception("[atas] erro msg=%s user=%s", msg_id, uid)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET atas_last_check_at = NOW(), updated_at = NOW() WHERE slack_user_id = %s",
+                (uid,),
+            )
+        conn.commit()
+
+def atas_worker_loop():
+    logger.info("[atas] worker iniciado (intervalo=%ss)", ATAS_POLL_SECONDS)
+    while True:
+        try:
+            if not GOOGLE_OAUTH_ENABLED:
+                logger.warning("[atas] GOOGLE_CLIENT_ID/SECRET ausentes — job ocioso")
+            else:
+                users = list_users_with_atas_enabled()
+                logger.info("[atas] usuários com atas on: %s", len(users))
+                for u in users:
+                    try:
+                        process_atas_for_user(u)
+                    except Exception:
+                        logger.exception("[atas] erro user=%s", u.get("slack_user_id"))
+        except Exception:
+            logger.exception("[atas] erro no ciclo do worker")
+        time.sleep(ATAS_POLL_SECONDS)
+
+# ---------------------------------------------------------------------------
+# Slack message helpers (existing)
+# ---------------------------------------------------------------------------
 def get_bot_user_id(client):
     global _BOT_USER_ID
     if _BOT_USER_ID is None:
@@ -396,31 +736,9 @@ def process_task_request(client, say, channel_id, thread_ts, raw_text, slack_use
         logger.exception("process_task_request error")
         say(f"❌ Erro ao processar: {e}", thread_ts=thread_ts)
 
-def process_atas_for_user(user):
-    logger.info("[atas] job user=%s email=%s (esqueleto)", user.get("slack_user_id"), user.get("google_email"))
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET atas_last_check_at = NOW(), updated_at = NOW() WHERE slack_user_id = %s",
-                (user["slack_user_id"],),
-            )
-        conn.commit()
-
-def atas_worker_loop():
-    logger.info("[atas] worker iniciado (intervalo=%ss)", ATAS_POLL_SECONDS)
-    while True:
-        try:
-            users = list_users_with_atas_enabled()
-            logger.info("[atas] usuários com atas on: %s", len(users))
-            for u in users:
-                try:
-                    process_atas_for_user(u)
-                except Exception:
-                    logger.exception("[atas] erro user=%s", u.get("slack_user_id"))
-        except Exception:
-            logger.exception("[atas] erro no ciclo do worker")
-        time.sleep(ATAS_POLL_SECONDS)
-
+# ---------------------------------------------------------------------------
+# Slack handlers
+# ---------------------------------------------------------------------------
 @app_slack.event("app_mention")
 def handle_mention(body, say, client):
     event = body.get("event", {})
@@ -501,7 +819,7 @@ def handle_atas_on(ack, say, command):
         say("⚠️ Conecte o Google antes de ativar atas.\nUse `/primeiro-login` e conclua a etapa Google.")
         return
     set_atas_enabled(user_id, True)
-    say("✅ *Atas automáticas ligadas.*\nQuando chegar uma ata por e-mail, o ResumeAI vai gerar tarefas no seu Trello.\n_Use `/atas-off` para desligar._")
+    say("✅ *Atas automáticas ligadas.*\nQuando chegar uma ata por e-mail, o ResumeAI gera tarefas no seu Trello.\n_Use `/atas-off` para desligar._")
 
 @app_slack.command("/atas-off")
 def handle_atas_off(ack, say, command):
@@ -514,6 +832,9 @@ def handle_atas_status(ack, say, command):
     ack()
     say(_atas_status_text(get_user(command.get("user_id"))))
 
+# ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
 PAGE_CSS = """
 body { font-family: system-ui, sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
 .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 24px; }
