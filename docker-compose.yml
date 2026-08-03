@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-resumeai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-resumeai_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-resumeai}
+    volumes:
+      - resumeai_pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resumeai} -d ${POSTGRES_DB:-resumeai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PORT:-10000}:10000"
+    env_file:
+      - .env
+    environment:
+      # Sobrescreve DATABASE_URL para apontar ao serviço db do compose
+      DATABASE_URL: postgresql://${POSTGRES_USER:-resumeai}:${POSTGRES_PASSWORD:-resumeai_secret}@db:5432/${POSTGRES_DB:-resumeai}
+      PORT: "10000"
+      # BASE_URL deve ser a URL pública (ngrok / domínio). Em local use o valor do .env
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+
+volumes:
+  resumeai_pgdata:
