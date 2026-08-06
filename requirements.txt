@@ -4,3 +4,4 @@ google-genai
 requests
 flask
 psycopg2-binary
+boto3
