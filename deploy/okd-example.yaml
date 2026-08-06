@@ -1,0 +1,107 @@
+# Exemplo de Deployment + Service + Route para OKD/OpenShift
+# Ajuste namespace, imagem, host da Route e credenciais AWS.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: resumeai-aws
+  namespace: resumeai
+type: Opaque
+stringData:
+  # Prefira IAM role / credencial de curta duração quando possível
+  AWS_ACCESS_KEY_ID: "AKIA..."
+  AWS_SECRET_ACCESS_KEY: "..."
+  # AWS_SESSION_TOKEN: ""  # se for credencial temporária
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resumeai
+  namespace: resumeai
+  labels:
+    app: resumeai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: resumeai
+  template:
+    metadata:
+      labels:
+        app: resumeai
+    spec:
+      containers:
+        - name: resumeai
+          image: sua-registry/resumeai:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10000
+          env:
+            - name: PORT
+              value: "10000"
+            - name: SSM_PREFIX
+              value: "/resumeai/prod"
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: resumeai-aws
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: resumeai-aws
+                  key: AWS_SECRET_ACCESS_KEY
+            # Opcional: sobrescrever um parâmetro sem ir ao SSM
+            # - name: BASE_URL
+            #   value: "https://resumeai.apps.cluster.example.com"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resumeai
+  namespace: resumeai
+spec:
+  selector:
+    app: resumeai
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: resumeai
+  namespace: resumeai
+spec:
+  host: resumeai.apps.seu-cluster.example.com
+  to:
+    kind: Service
+    name: resumeai
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
