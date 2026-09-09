@@ -309,6 +309,4 @@ Criado/migrado no boot (`init_db`).
 
 ---
 
-## Licença
 
-Uso interno / adaptação pela empresa.
