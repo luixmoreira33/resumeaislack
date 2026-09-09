@@ -2,7 +2,7 @@
 
 Bot de produtividade para **Slack** que transforma mensagens, threads, anexos e **atas de reunião do Google** em tarefas no **Trello**, usando **Gemini**.
 
-Cada usuário conecta o **próprio** Trello e Google. Ideal para atividades **individuais** (o Jira continua sendo o espaço de times/equipes).
+Cada usuário conecta o **próprio** Trello e Google. Ideal para atividades **individuais** .
 
 ---
 
