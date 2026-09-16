@@ -77,3 +77,7 @@ _BOT_USER_ID = None
 _PROCESSED = set()
 _PROCESSED_LOCK = threading.Lock()
 IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/heic", "image/heif"}
+
+import runpy
+runpy.run_path("runtime_a.py", init_globals=globals(), run_name="runtime_a")
+runpy.run_path("runtime_b.py", init_globals=globals(), run_name=__name__)
