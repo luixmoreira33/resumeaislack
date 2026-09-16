@@ -31,16 +31,33 @@ def _cosine(a, b):
 def _embed_texts(client, texts):
     if not texts:
         return []
-    result = client.models.embed_content(
-        model=GEMINI_EMBEDDING_MODEL,
-        contents=texts,
-        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768),
-    )
-    out = []
-    for emb in result.embeddings or []:
-        vals = getattr(emb, "values", None)
-        out.append(list(vals) if vals else [])
-    return out
+    clean = [t for t in texts if (t or "").strip()]
+    if not clean:
+        return []
+    configs = [
+        types.EmbedContentConfig(output_dimensionality=768),
+        types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768),
+        None,
+    ]
+    last_err = None
+    for cfg in configs:
+        try:
+            kwargs = {"model": GEMINI_EMBEDDING_MODEL, "contents": clean}
+            if cfg is not None:
+                kwargs["config"] = cfg
+            result = client.models.embed_content(**kwargs)
+            out = []
+            for emb in result.embeddings or []:
+                vals = getattr(emb, "values", None)
+                out.append(list(vals) if vals else [])
+            if out:
+                return out
+        except Exception as e:
+            last_err = e
+            logger.warning("[embed] tentativa falhou (%s): %s", type(cfg).__name__ if cfg else "no-config", e)
+    if last_err:
+        raise last_err
+    return []
 
 
 def _split_chunks(text, size=900):
@@ -129,20 +146,38 @@ def parse_json_response(resp):
 
 
 def gemini_json(client, system_instruction, user_parts):
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        response_mime_type="application/json",
-        temperature=0.1,
-    )
-    try:
-        config.thinking_config = types.ThinkingConfig(thinking_budget=0)
-    except Exception:
-        pass
-    return client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_parts,
-        config=config,
-    )
+    """Gera JSON. Gemini 3.x usa thinking_level; thinking_budget=0 causa 400."""
+    thinking_opts = [
+        types.ThinkingConfig(thinking_level="minimal"),
+        types.ThinkingConfig(thinking_level="MINIMAL"),
+        None,
+    ]
+    last_err = None
+    for think in thinking_opts:
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+            temperature=0.1,
+        )
+        if think is not None:
+            try:
+                config.thinking_config = think
+            except Exception:
+                pass
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=user_parts,
+                config=config,
+            )
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            logger.warning("[gemini] generate falhou (think=%s): %s", getattr(think, "thinking_level", None), e)
+            if "INVALID_ARGUMENT" not in msg and "invalid argument" not in msg.lower():
+                raise
+            continue
+    raise last_err
 
 
 def filter_tasks_for_person(tasks, person_name, person_email):
@@ -194,7 +229,7 @@ def analyze_ata_tasks(client, doc_text, meeting_title, person_name, person_email
         f"Pessoa-alvo (ÚNICA): {name}\nE-mail-alvo: {email}\n"
         f"Reunião: {meeting_title}\nHoje: {today}\n\n"
         "Trechos da ata já filtrados por relevância a essa pessoa:\n"
-        f'\"\"\"{focused}\"\"\"\n\n'
+        f'"""{focused}"""\n\n'
         'JSON: {"theme":"...","meeting_title":"...","tasks":'
         '[{"title":"...","assignee":"nome","due_date":"YYYY-MM-DD ou null"}]}'
     )
