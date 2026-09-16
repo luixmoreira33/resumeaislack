@@ -76,7 +76,13 @@ def person_tokens(person_name, person_email):
     return {t for t in tokens if t}
 
 
+def _mentions_person(text, tokens):
+    low = (text or "").lower()
+    return bool(tokens) and any(tok in low for tok in tokens)
+
+
 def select_ata_passages(client, doc_text, person_name, person_email):
+    """Recorta a ata com Embedding 2 + menções do usuário (economiza tokens do Flash-Lite)."""
     text = (doc_text or "").strip()
     if len(text) <= ATA_MAX_CHARS:
         return text
@@ -84,8 +90,7 @@ def select_ata_passages(client, doc_text, person_name, person_email):
     tokens = person_tokens(person_name, person_email)
     keyword_hits, others = [], []
     for ch in chunks:
-        low = ch.lower()
-        if tokens and any(t in low for t in tokens):
+        if _mentions_person(ch, tokens):
             keyword_hits.append(ch)
         else:
             others.append(ch)
@@ -141,17 +146,25 @@ def gemini_json(client, system_instruction, user_parts):
 
 
 def filter_tasks_for_person(tasks, person_name, person_email):
+    """Segunda barreira: descarta tarefa se o assignee não for a pessoa-alvo."""
     tokens = person_tokens(person_name, person_email)
+    self_words = {"eu", "mim", "usuario", "usuário", "user", "me", "myself"}
     kept = []
     for t in tasks or []:
         title = (t.get("title") or "").strip()
         if not title:
             continue
         assignee = (t.get("assignee") or t.get("owner") or "").strip().lower()
-        if assignee and tokens and not any(tok in assignee for tok in tokens):
-            if assignee not in ("eu", "mim", "usuario", "usuário", "user"):
-                logger.info("[atas] descartou tarefa de outro: %s (%s)", title, assignee)
-                continue
+        assigned_to_self = (
+            (assignee and (assignee in self_words or _mentions_person(assignee, tokens)))
+            or (not assignee and _mentions_person(title, tokens))
+        )
+        if tokens and not assigned_to_self and assignee and assignee not in self_words:
+            logger.info("[atas] descartou tarefa de outro: %s (%s)", title, assignee)
+            continue
+        if tokens and not assigned_to_self and not assignee:
+            logger.info("[atas] descartou tarefa sem assignee explícito: %s", title)
+            continue
         kept.append(t)
     return kept
 
@@ -166,12 +179,14 @@ def analyze_ata_tasks(client, doc_text, meeting_title, person_name, person_email
         "REGRA ABSOLUTA — leia duas vezes antes de responder:\n"
         f"ATENÇÃO: Extraia APENAS as tarefas atribuídas EXPLICITAMENTE a [{name}] "
         f"(e-mail [{email}]).\n"
-        "Ignore COMPLETAMENTE tarefas de outras pessoas, mesmo que estejam na mesma lista, "
-        "mesmo parágrafo ou mesma tabela.\n"
+        "Ignore COMPLETAMENTE as tarefas de outras pessoas, mesmo que estejam na mesma "
+        "lista, no mesmo parágrafo ou na mesma tabela.\n"
         "Não invente. Não atribua tarefa coletiva ao usuário, a menos que o texto diga "
-        f"claramente que [{name}] é responsável.\n"
-        f"Sinais válidos: o nome, o e-mail, 'você', ou 'responsável: {name}'.\n"
+        f"claramente que [{name}] é o responsável.\n"
+        f"Sinais válidos de atribuição: o nome [{name}], o e-mail [{email}], "
+        f"'você', ou 'responsável: {name}'.\n"
         "Se não houver tarefa explícita dessa pessoa, devolva tasks=[].\n"
+        "Preencha sempre o campo assignee com o nome de quem ficou responsável.\n"
         "Theme deve ser ESPECÍFICO (ex. Kick-off SmartDev), nunca genérico.\n"
         "Responda somente JSON."
     )
