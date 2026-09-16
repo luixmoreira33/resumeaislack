@@ -79,5 +79,19 @@ _PROCESSED_LOCK = threading.Lock()
 IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/heic", "image/heif"}
 
 import runpy
-runpy.run_path("runtime_a.py", init_globals=globals(), run_name="runtime_a")
-runpy.run_path("runtime_b.py", init_globals=globals(), run_name=__name__)
+
+def _load_runtime(path, ns):
+    loaded = runpy.run_path(path, init_globals=ns, run_name=path)
+    ns.update(loaded)
+    globals().update(loaded)
+    return ns
+
+_ns = dict(globals())
+_load_runtime("runtime_a.py", _ns)
+_load_runtime("runtime_b.py", _ns)
+
+if __name__ == "__main__":
+    init_db()
+    threading.Thread(target=lambda: SocketModeHandler(app_slack, SLACK_APP_TOKEN).start(), daemon=True).start()
+    threading.Thread(target=atas_worker_loop, daemon=True).start()
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
