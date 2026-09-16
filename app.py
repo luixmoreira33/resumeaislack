@@ -80,18 +80,29 @@ IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"
 
 import runpy
 
-def _load_runtime(path, ns):
-    loaded = runpy.run_path(path, init_globals=ns, run_name=path)
-    ns.update(loaded)
-    globals().update(loaded)
-    return ns
+_SKIP_KEYS = {"__name__", "__file__", "__cached__", "__builtins__", "__spec__", "__loader__", "__package__", "__doc__"}
 
-_ns = dict(globals())
-_load_runtime("runtime_a.py", _ns)
-_load_runtime("runtime_b.py", _ns)
+def _load_runtime(path):
+    loaded = runpy.run_path(path, init_globals=dict(globals()), run_name=path)
+    for key, value in loaded.items():
+        if key in _SKIP_KEYS:
+            continue
+        globals()[key] = value
 
-if __name__ == "__main__":
+_load_runtime("runtime_a.py")
+_load_runtime("runtime_b.py")
+
+def start_app():
+    logger.info("Subindo %s (Flask + Slack Socket Mode + worker de atas)", APP_NAME)
     init_db()
-    threading.Thread(target=lambda: SocketModeHandler(app_slack, SLACK_APP_TOKEN).start(), daemon=True).start()
-    threading.Thread(target=atas_worker_loop, daemon=True).start()
+    threading.Thread(
+        target=lambda: SocketModeHandler(app_slack, SLACK_APP_TOKEN).start(),
+        daemon=True,
+        name="slack-socket",
+    ).start()
+    threading.Thread(target=atas_worker_loop, daemon=True, name="atas-worker").start()
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
+
+# Sempre sobe o servidor quando este arquivo e executado pelo entrypoint/container.
+# Nao depender de __name__ == "__main__": o runpy dos runtimes pode sobrescrever __name__.
+start_app()
