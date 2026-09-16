@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY app.py ssm_config.py entrypoint.py ./
+COPY app.py gemini_extract.py ssm_config.py entrypoint.py ./
 
 # Usuário não-root
 RUN useradd --create-home --uid 10001 appuser \
