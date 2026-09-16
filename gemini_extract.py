@@ -99,7 +99,6 @@ def _mentions_person(text, tokens):
 
 
 def select_ata_passages(client, doc_text, person_name, person_email):
-    """Recorta a ata com Embedding 2 + menções do usuário (economiza tokens do Flash-Lite)."""
     text = (doc_text or "").strip()
     if len(text) <= ATA_MAX_CHARS:
         return text
@@ -146,7 +145,6 @@ def parse_json_response(resp):
 
 
 def gemini_json(client, system_instruction, user_parts):
-    """Gera JSON. Gemini 3.x usa thinking_level; thinking_budget=0 causa 400."""
     thinking_opts = [
         types.ThinkingConfig(thinking_level="minimal"),
         types.ThinkingConfig(thinking_level="MINIMAL"),
@@ -181,7 +179,6 @@ def gemini_json(client, system_instruction, user_parts):
 
 
 def filter_tasks_for_person(tasks, person_name, person_email):
-    """Segunda barreira: descarta tarefa se o assignee não for a pessoa-alvo."""
     tokens = person_tokens(person_name, person_email)
     self_words = {"eu", "mim", "usuario", "usuário", "user", "me", "myself"}
     kept = []
@@ -202,6 +199,22 @@ def filter_tasks_for_person(tasks, person_name, person_email):
             continue
         kept.append(t)
     return kept
+
+
+def agenda_card_title(meeting_title, subject=None):
+    """Título fixo do card de ata: 'Google Meet - nome da agenda'."""
+    raw = (meeting_title or subject or "Reunião").strip()
+    quoted = re.search(r'["\u201c\u201d\']([^"\u201c\u201d\']+)["\u201c\u201d\']', raw)
+    if quoted:
+        name = quoted.group(1).strip()
+    else:
+        name = re.sub(r"(?i)^anota(?:ções|coes)\s*:\s*", "", raw).strip()
+        name = re.sub(r"(?i)\s+em\s+\d{1,2}\s+de\s+\w+\.?\s+de\s+\d{4}\s*$", "", name).strip()
+        name = name.strip(" \"'")
+    name = name or "Reunião"
+    if re.match(r"(?i)^google\s*meet\s*-", name):
+        return name[:80]
+    return f"Google Meet - {name}"[:80]
 
 
 def analyze_ata_tasks(client, doc_text, meeting_title, person_name, person_email):
@@ -236,8 +249,9 @@ def analyze_ata_tasks(client, doc_text, meeting_title, person_name, person_email
     resp = gemini_json(client, system, user)
     data = parse_json_response(resp)
     tasks = filter_tasks_for_person(data.get("tasks") or [], name, email)
-    theme = (data.get("theme") or data.get("meeting_title") or meeting_title or "Reunião").strip()
-    return theme, data.get("meeting_title") or meeting_title, tasks
+    agenda = data.get("meeting_title") or meeting_title
+    theme = agenda_card_title(agenda, meeting_title)
+    return theme, agenda or meeting_title, tasks
 
 
 def analyze_with_gemini(client, text_content, images=None):
